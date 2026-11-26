@@ -68,8 +68,125 @@ function home(){
  // 실제 표시된 경계상자를 매 프레임 검사하여 모델 원점이 멀리 떨어진 GLB도 화면 밖으로 튀지 않게 합니다.
  msg('동물을 터치하여 회전 · 두 손가락으로 확대/축소');buttons([['📷 카메라 켜기',startCamera,true]]);
 }
-async function startCamera(){try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});video.srcObject=stream;await video.play();video.style.display='block';mode='choose';clear();background('safari-background.png',.25);$('subtitle').textContent='체험관을 선택하세요';status('카메라 합성형 체험: 실제 바닥 인식이나 공간 고정 기능은 제공하지 않습니다.');msg('책상이나 바닥을 비추고 체험관을 선택하세요');buttons([['🌳 육지관',()=>enter('land')],['🌊 바다관',()=>enter('sea')],['처음으로',reset]])}catch(e){status('카메라 접근 실패: 브라우저 권한을 확인해 주세요.')}}
-function reset(){stream?.getTracks().forEach(t=>t.stop());stream=null;home()}
+let cameraSession = 0;
+let starting = false;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function stopStream(stream) { if (stream) stream.getTracks().forEach(t => t.stop()); }
+function releaseCamera() {
+  cameraSession++;
+  stopStream(stream);
+  stream = null;
+  video.pause();
+  video.srcObject = null;
+  video.style.display='none';
+}
+function statusMessage(text) {
+  status(text);
+}
+function cameraError(name, message) { return new DOMException(message, name); }
+function isRear(track) {
+  const facing = track.getSettings().facingMode;
+  return facing ? facing === 'environment' : /back|rear|environment|후면/i.test(track.label);
+}
+function fatal(err) { return ['NotAllowedError','SecurityError','SessionEndedError','TimeoutError'].includes(err.name); }
+async function bounded(promise, deadline, onLate) {
+  let expired = false, timer;
+  const guarded = Promise.resolve(promise).then(value => {
+    if (expired) { if (onLate) onLate(value); throw cameraError('TimeoutError','Camera timeout'); }
+    return value;
+  });
+  try {
+    return await Promise.race([guarded, new Promise((_, reject) => {
+      timer = setTimeout(() => { expired = true; reject(cameraError('TimeoutError','Camera timeout')); }, Math.max(0, deadline-Date.now()));
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function acquireCamera(cameraMode) {
+  releaseCamera();
+  const session = cameraSession, deadline = Date.now()+60000;
+  const media = navigator.mediaDevices;
+  if (!media || !media.getUserMedia) throw cameraError('NotSupportedError','Camera unavailable');
+  function check() {
+    if (session !== cameraSession) throw cameraError('SessionEndedError','Session ended');
+    if (Date.now() >= deadline) throw cameraError('TimeoutError','Camera timeout');
+  }
+  async function acquire(constraints) {
+    check();
+    const stream = await bounded(media.getUserMedia({video:constraints,audio:false}), deadline, stopStream);
+    try { check(); } catch(e) { stopStream(stream); throw e; }
+    return stream;
+  }
+  async function attempt(constraints) {
+    const acquired = await acquire(constraints);
+    try {
+      const track = acquired.getVideoTracks()[0];
+      if (!track || (cameraMode === 'environment' && !isRear(track))) throw cameraError('NotFoundError','Rear camera not confirmed');
+      stream = acquired;
+      video.srcObject = acquired;
+      await bounded(video.play(), deadline);
+      check();
+      if (!video.videoWidth || !video.videoHeight) throw cameraError('NotReadableError','No video frames');
+    } catch(e) {
+      stopStream(acquired);
+      if (stream === acquired) { stream = null; video.srcObject = null; }
+      throw e;
+    }
+  }
+  statusMessage('카메라를 실행하고 있습니다.');
+  try {
+    await attempt({facingMode:{ideal:cameraMode}});
+    return;
+  } catch(e) { if (cameraMode !== 'environment' || fatal(e)) throw e; }
+  statusMessage('다른 후면카메라를 찾고 있습니다.');
+  let devices = await bounded(media.enumerateDevices(),deadline);
+  if (!devices.some(d => d.kind === 'videoinput' && d.label)) {
+    let probe;
+    try {
+      probe = await acquire(true);
+      devices = await bounded(media.enumerateDevices(),deadline);
+    } catch(e) { if (fatal(e)) throw e; }
+    finally { stopStream(probe); }
+  }
+  const candidates = devices.filter(d => d.kind === 'videoinput' && d.deviceId && !/front|user|전면/i.test(d.label));
+  candidates.sort((a,b) => Number(/back|rear|environment|후면/i.test(b.label))-Number(/back|rear|environment|후면/i.test(a.label)));
+  let last = cameraError('NotFoundError','No rear camera');
+  for (const d of candidates) {
+    for (const extra of [{},{width:{ideal:640},height:{ideal:480},frameRate:{ideal:15}}]) {
+      check(); await delay(700);
+      try { await attempt({deviceId:{exact:d.deviceId},...extra}); return; }
+      catch(e) { last=e; if (fatal(e)) throw e; console.warn('Camera candidate failed',d.label,e.name); }
+    }
+  }
+  throw last;
+}
+function explainCameraError(err) {
+  if (['NotAllowedError','SecurityError'].includes(err.name)) return '카메라 사용 권한을 확인해 주세요. 브라우저 또는 카카오톡의 사이트 설정에서 카메라를 허용한 후 다시 선택해 주세요.';
+  if (err.name === 'NotSupportedError') return '이 브라우저에서는 카메라를 사용할 수 없습니다. Chrome 또는 삼성 브라우저에서 다시 접속해 주세요.';
+  return '카메라를 실행하지 못했습니다.\n다른 카메라 사용 앱을 종료하고 브라우저를 다시 열어 주세요. 문제가 지속되면 스마트폰을 재부팅해 주세요.\n오류 코드: '+(err.name || 'UnknownError');
+}
+async function startCamera(){
+ if(starting)return;
+ starting=true;
+ const button=toolbar.querySelector('button');
+ if(button){button.disabled=true;button.textContent='📷 카메라 준비 중';}
+ const expectedSession=cameraSession+1;
+ try{
+  await acquireCamera('environment');
+  if(expectedSession!==cameraSession)return;
+  video.style.display='block';mode='choose';clear();background('safari-background.png',.25);
+  $('subtitle').textContent='체험관을 선택하세요';
+  status('카메라 합성형 체험: 실제 바닥 인식이나 공간 고정 기능은 제공하지 않습니다.');
+  msg('책상이나 바닥을 비추고 체험관을 선택하세요');
+  buttons([['🌳 육지관',()=>enter('land')],['🌊 바다관',()=>enter('sea')],['처음으로',reset]]);
+ }catch(e){
+  if(expectedSession!==cameraSession)return;
+  releaseCamera();status('카메라 실행 실패 · 다시 시도해 주세요.');
+  alert(explainCameraError(e));
+ }finally{starting=false;if(button){button.disabled=false;button.textContent='📷 카메라 켜기';}}
+}
+function reset(){releaseCamera();home()}
+window.addEventListener('pagehide',()=>{releaseCamera();sound(null);});
+window.addEventListener('pageshow',e=>{if(e.persisted)home();});
 function enter(which){mode=which;clear();drag=0;camera.rotation.set(0,0,0);camera.position.set(0,0,12);let land=which==='land';background(land?'forest-background.png':'ocean-background.png',.42);sound(land?'forest':'ocean');$('subtitle').textContent=land?'🌳 육지관 — 숲과 초원':'🌊 바다관 — 해저 탐험';msg(land?'동물을 선택해 주세요':'멀리서 동물이 다가옵니다');buttons(land?[['🐻 곰',()=>show('bear')],['🐦 새',()=>show('sparrow')],['🦏 코뿔소',()=>show('rhino')],['모두',()=>show('all')],['🌊 바다관',()=>enter('sea')],['처음으로',reset]]:[['🐋 고래',()=>show('whale')],['🐢 거북이',()=>show('turtle')],['모두',()=>show('all')],['🌳 육지관',()=>enter('land')],['처음으로',reset]])}
 function show(name){clear();const multiple=name==='all';const spread=innerWidth<innerHeight?.75:1.5;if(mode==='land'){
  if(name==='bear'||multiple)place('bear',multiple?.28:.5,.60,multiple?.20:.29,{behavior:'run',heading:sideHeading('bear')-.4});
